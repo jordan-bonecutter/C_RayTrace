@@ -13,6 +13,7 @@ vec3d_t v3d_add(vec3d_t* v1, vec3d_t* v2){
 
   vec3d_t ret;
 
+  /* add componentwise */
   ret.x = v1->x + v2->x;
   ret.y = v1->y + v2->y;
   ret.z = v1->z + v2->z;
@@ -25,6 +26,7 @@ vec3d_t v3d_scale(vec3d_t* v, double s){
 
   vec3d_t ret;
 
+  /* vector scale */
   ret.x = v->x * s;
   ret.y = v->y * s;
   ret.z = v->z * s;

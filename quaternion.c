@@ -12,6 +12,7 @@ quaternion_t q_add(quaternion_t *q1, quaternion_t *q2){
   assert(q1);
   assert(q2);
 
+  /* add componentwise */
   quaternion_t ret;
   ret.real = q1->real + q2->real;
   ret.i = q1->i + q2->i;
@@ -27,6 +28,7 @@ quaternion_t q_mul(quaternion_t *q1, quaternion_t *q2){
 
   quaternion_t ret;
 
+  /* multiply according to the right hand rule */
   ret.real = q1->real*q2->real - q1->i*q2->i - q1->j*q2->j - q1->k*q2->k;
   ret.i    = q1->real*q2->i + q1->i*q2->real + q1->j*q2->k - q1->k*q2->j;
   ret.j    = q1->real*q2->j - q1->i*q2->k + q1->j*q2->real + q1->k*q2->i;
@@ -39,6 +41,7 @@ quaternion_t q_conj(quaternion_t *q){
 
   quaternion_t ret;
 
+  /* complex conjugate */
   ret.real = q->real;
   ret.i    = -q->i;
   ret.j    = -q->j;

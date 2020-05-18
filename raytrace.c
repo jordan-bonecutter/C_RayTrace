@@ -14,38 +14,84 @@
 #include <string.h>
 #include <openip.h>
 
+/* camera struct:
+ *  origin: camera location
+ *  i: camera forward vector
+ *  j: camera right vector
+ *  k: camera up vector
+ *  */
 typedef struct{
   vec3d_t origin, i, j, k;
   double fov;
 } camera_t;
 
+/* intersection struct:
+ *  did_intersect: true if the ray meets object, false otherwise
+ *  point: location where ray hits object
+ *  normal: object normal at intersection point
+ *  specular: object's specular function
+ *  */
 typedef struct{
   bool did_intersect;
   vec3d_t point, normal, specular; 
 } intersection_t;
 
+/* ray struct:
+ *  origin: first ray point
+ *  direction: ray travel direction
+ *  energy: ray light energy for each rgb component
+ *  */
 typedef struct{
   vec3d_t origin, direction, energy;
 } ray_t;
 
+/* intersection_nearest function:
+ *  should be defined for each object type. For instance,
+ *  for a sphere this function should return the closest
+ *  valid intersection for a given ray
+ *  */
 typedef intersection_t (*intersection_nearest)(ray_t*, void* object_parameters);
 
+/* scene_object struct:
+ *  parameters: object instance parameters
+ *  get_intersection: object intersection function
+ *  specular: object specular function
+ *  
+ *
+ *  I like to think of this as a "base class" which all scene objects
+ *  must "inherit". Obviously, C doesn't have real classes so this
+ *  is just about the next best thing we can get.
+ *
+ *  When you want to create a new scene_object type, you need to 
+ *  define a new object_params struct which parameters points to. 
+ *  You also need to write an intersection function so that you
+ *  can do intersection tests.*/
 typedef struct{
   void* parameters;
   intersection_nearest get_intersection;
   vec3d_t specular;
 } scene_object_t;
 
+/* sphere_params struct:
+ *  origin: sphere center
+ *  radius: sphere radius
+ *  */
 struct sphere_params{
   vec3d_t origin;
   double radius;
 };
 
+/* plane_params struct:
+ *  point: a point on the plane
+ *  normal: unit vector normal to the plane
+ *  */
 struct plane_params{
   vec3d_t point;
   vec3d_t normal;
 };
 
+/* takes in a list of all scene objects and returns the closest intersection */
+// TODO: add  scene struct and make this function take in only the scene
 intersection_t closest_intersection(scene_object_t* scene_objects, int N, ray_t* ray){
   assert(scene_objects);
   assert(ray);
@@ -55,6 +101,9 @@ intersection_t closest_intersection(scene_object_t* scene_objects, int N, ray_t*
   intersection_t ret, curr_intersect;
   vec3d_t tmp;
   ret.did_intersect = false;
+
+  // Loop through each intersection and return the one that happened closest to the
+  // origin of the current ray
   for(i = 0; i < N; i++){
     curr_intersect = scene_objects[i].get_intersection(ray, scene_objects[i].parameters);
     if(!curr_intersect.did_intersect){
@@ -74,6 +123,8 @@ intersection_t closest_intersection(scene_object_t* scene_objects, int N, ray_t*
   return ret;
 }
 
+/* plane intersection function */
+/* The algorithm I used can be found at https://en.wikipedia.org/wiki/Line–plane_intersection */
 intersection_t plane_intersection(ray_t* ray, void* object_parameters){
   assert(ray);
   assert(object_parameters);
@@ -106,6 +157,8 @@ intersection_t plane_intersection(ray_t* ray, void* object_parameters){
   return ret;
 }
 
+/* sphere intersection function */
+/* The algorithm I used can be found at https://en.wikipedia.org/wiki/Line–sphere_intersection*/
 intersection_t sphere_intersection(ray_t* ray, void* object_parameters){
   assert(ray);
   assert(object_parameters);
@@ -158,6 +211,11 @@ intersection_t sphere_intersection(ray_t* ray, void* object_parameters){
   return ret;
 }
 
+/* create a new camera with the parameters.
+ * theta tilts the camera up and down
+ * phi pans the camera side to side
+ * alpha twists the camera clockwise 
+ * fov is the vertical angle which the camera captures */
 camera_t camera_with(vec3d_t* origin, double theta, double phi, double alpha, double fov){
   assert(origin);
   
@@ -166,21 +224,39 @@ camera_t camera_with(vec3d_t* origin, double theta, double phi, double alpha, do
   ret.origin = *origin;
   ret.fov    = fov;
 
+  /* divide by two because of
+   * our quaternion based algorithm */
   theta /= 2.;
   phi /= 2.;
   alpha /= 2.;
 
-  // Setup rotation quaternions
+  /* the best way i've figured out to rotate the camera is using quaternions 
+   * (I know, it's probably overkill but meh). I carry out the procedure with 
+   * 3 quaternion rotations. I could do it with one but this way makes it far
+   * easier to keep track of which axis I'm rotating about. If you are unfamiliar
+   * with how quaternions are helpful in computing 3d rotations, I recommend 3blue1brown's
+   * excellent YouTube series on them, but I'll give a brief explanation here. Quaternion
+   * rotation is done via multiplication by two quaternions which are complex conjugates
+   * of each other. The axis of rotation is about the axis perpenidular to the imaginary
+   * part of the leftmost quaternion. The first quaternion pair I rotate about is pointing 
+   * "up" so this pans the camera side to side (phi). The second pair is pointing to the
+   * right, so this tilts the camera up and down(theta). Finally, the camera is rotated 
+   * about the axis which it is facing, makng the scene appear to rotate (alpha). */
+
   quaternion_t q1, q2, q3, q4, q5, q6, new_j, new_i, new_k;
+
+  // Rotate about k (phi)
   q1.real = cos(phi), q1.i = 0, q1.j = 0, q1.k = sin(phi);
   q2 = q_conj(&q1);
 
+  // Roatate about j (theta)
   new_j.real = 0., new_j.i = 0., new_j.j = 1., new_j.k = 0.;
   new_j = q_mul(&q1, &new_j);
   new_j = q_mul(&new_j, &q2);
   q3.real = cos(theta), q3.i = new_j.i*sin(theta), q3.j = new_j.j*sin(theta), q3.k = 0;
   q4 = q_conj(&q3);
   
+  // Rotate about i
   new_i.real = 0., new_i.i = 1., new_i.j = 0., new_i.k = 0.;
   new_i = q_mul(&q1, &new_i);
   new_i = q_mul(&new_i, &q2);
@@ -209,6 +285,7 @@ camera_t camera_with(vec3d_t* origin, double theta, double phi, double alpha, do
   return ret;
 }
 
+/* get the ray originating at the camera passing through image plane point x, y */
 ray_t camera_get_ray(camera_t* camera, double y, double x, int height, int width){
   assert(camera);
   
@@ -216,6 +293,8 @@ ray_t camera_get_ray(camera_t* camera, double y, double x, int height, int width
   double l;
   vec3d_t ret, tmp;
 
+  // We want the scene to always render with the same fov no matter
+  // the resolution, so we do some trig to ensure this happens
   l = height / (2*tan(camera->fov/2));
   y = height/2. - y;
   x -= width/2.;
@@ -234,6 +313,7 @@ ray_t camera_get_ray(camera_t* camera, double y, double x, int height, int width
   return ray;
 }
 
+/* bounce the ray and reduce its energy or return sky color */
 vec3d_t ray_hit(ray_t* ray, intersection_t* intersection){
   assert(ray);
   assert(intersection);
@@ -241,26 +321,36 @@ vec3d_t ray_hit(ray_t* ray, intersection_t* intersection){
   vec3d_t tmp;
   
   if(intersection->did_intersect){
+    // Scooch the ray forward a little bit from the surface
+    // so it doesn't double bounce
     tmp = v3d_scale(&intersection->normal, 0.000001);
     ray->origin = v3d_add(&tmp, &intersection->point);
+
+    // Bounced ray = ray - 2*proj_normal(ray)
     tmp = v3d_scale(&intersection->normal, -2*v3d_dot(&ray->direction, &intersection->normal));
     ray->direction = v3d_add(&ray->direction, &tmp);
+
+    // Reduce ray energy
     ray->energy.x *= intersection->specular.x;
     ray->energy.y *= intersection->specular.y;
     ray->energy.z *= intersection->specular.z;
 
     return (vec3d_t){0., 0., 0.};
   } else {
+    // Sky hit
     ray->energy = (vec3d_t){0., 0., 0.};
     return (vec3d_t){1.1*200., 1.1*200., 1.1*255.};
   }
 }
 
+/* max(min(255, val), 0) so that we don't int overflow */
 unsigned char squash(double v){
   v = v > 0 ? v : 0;
   v = v < 255 ? v : 255;
   return (unsigned char)v;
 }
+
+/* Hot damn, this part's a mess! Hopefully I can clean it up :) */
 
 #define BOUNCE_LIMIT  5
 #define SAMPLES_PER_PIXEL 8
