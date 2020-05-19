@@ -313,12 +313,23 @@ ray_t camera_get_ray(camera_t* camera, double y, double x, int height, int width
   return ray;
 }
 
+long mod(long a, long b){
+  if(a < 0){
+    return (a%b) + b - 1;
+  } else {
+    return a%b;
+  }
+}
+
 /* bounce the ray and reduce its energy or return sky color */
-vec3d_t ray_hit(ray_t* ray, intersection_t* intersection){
+vec3d_t ray_hit(ray_t* ray, intersection_t* intersection, img* skybox, double skyheight){
   assert(ray);
   assert(intersection);
 
   vec3d_t tmp;
+  double t;
+  long sx, sy;
+  pixel p;
   
   if(intersection->did_intersect){
     // Scooch the ray forward a little bit from the surface
@@ -338,8 +349,17 @@ vec3d_t ray_hit(ray_t* ray, intersection_t* intersection){
     return (vec3d_t){0., 0., 0.};
   } else {
     // Sky hit
+    t = (skyheight - ray->origin.z)/ray->direction.z;
+    sx = ray->origin.x + ray->direction.x*t;
+    sy = ray->origin.y + ray->direction.y*t;
+    sx = mod(sx, skybox->width);
+    sy = mod(sy, skybox->height);
+    p = skybox->pix[sy][sx];
+    tmp.x = p.r*1.1;
+    tmp.y = p.g*1.1;
+    tmp.z = p.b*1.1;
     ray->energy = (vec3d_t){0., 0., 0.};
-    return (vec3d_t){1.1*200., 1.1*200., 1.1*255.};
+    return tmp;
   }
 }
 
@@ -354,8 +374,8 @@ unsigned char squash(double v){
 
 #define BOUNCE_LIMIT  5
 #define SAMPLES_PER_PIXEL 8
-#define HEIGHT 100
-#define WIDTH  100
+#define HEIGHT 1000
+#define WIDTH  1000
 #define SPHERES 21
 
 int main()
@@ -370,6 +390,8 @@ int main()
   struct plane_params plane_params;
   int i, iy, y, x, bounce, sample;
   double r, g, b, x_offset[SAMPLES_PER_PIXEL], y_offset[SAMPLES_PER_PIXEL];
+  img_ioerr err;
+  img* skybox = img_from_png("skybox.png", &err);
 
   for(i = 0; i < SAMPLES_PER_PIXEL; i++){
     x_offset[i] = 0.5*cos(2.*M_PI*i/SAMPLES_PER_PIXEL);
@@ -413,7 +435,7 @@ int main()
         for(bounce = 0; bounce < BOUNCE_LIMIT; bounce++){
           curr_intersection = closest_intersection(&scene_objects[0], SPHERES*SPHERES+1, &curr_ray);
           curr_energy = curr_ray.energy;
-          curr_texture = ray_hit(&curr_ray, &curr_intersection);
+          curr_texture = ray_hit(&curr_ray, &curr_intersection, skybox, 400);
           curr_sample.x += curr_energy.x * curr_texture.x;
           curr_sample.y += curr_energy.y * curr_texture.y;
           curr_sample.z += curr_energy.z * curr_texture.z;
