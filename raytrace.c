@@ -32,7 +32,7 @@ typedef struct{
  *  specular: object's specular function
  *  */
 typedef struct{
-  bool did_intersect;
+  bool did_intersect, sky;
   vec3d_t point, normal, specular; 
 } intersection_t;
 
@@ -50,7 +50,13 @@ typedef struct{
  *  for a sphere this function should return the closest
  *  valid intersection for a given ray
  *  */
-typedef intersection_t (*intersection_nearest)(ray_t*, void* object_parameters);
+typedef intersection_t (*object_intersector)(ray_t*, void* object_parameters);
+
+/* object_texturemap function:
+ *  can have multiple definitions for each object type. 
+ *  allows for objects to be textured with an image or constant
+ *  */
+typedef vec3d_t (*object_texturemap)(vec3d_t* object_point, void* object_parameters, img* itexture);
 
 /* scene_object struct:
  *  parameters: object instance parameters
@@ -68,8 +74,9 @@ typedef intersection_t (*intersection_nearest)(ray_t*, void* object_parameters);
  *  can do intersection tests.*/
 typedef struct{
   void* parameters;
-  intersection_nearest get_intersection;
+  object_intersector get_intersection;
   vec3d_t specular;
+  bool sky;
 } scene_object_t;
 
 /* sphere_params struct:
@@ -117,6 +124,7 @@ intersection_t closest_intersection(scene_object_t* scene_objects, int N, ray_t*
       mindist = curr_dist;
       ret = curr_intersect;
       ret.specular = scene_objects[i].specular;
+      ret.sky = scene_objects[i].sky;
     }
   }
 
@@ -125,7 +133,7 @@ intersection_t closest_intersection(scene_object_t* scene_objects, int N, ray_t*
 
 /* plane intersection function */
 /* The algorithm I used can be found at https://en.wikipedia.org/wiki/Line–plane_intersection */
-intersection_t plane_intersection(ray_t* ray, void* object_parameters){
+intersection_t plane_intersector(ray_t* ray, void* object_parameters){
   assert(ray);
   assert(object_parameters);
 
@@ -159,7 +167,7 @@ intersection_t plane_intersection(ray_t* ray, void* object_parameters){
 
 /* sphere intersection function */
 /* The algorithm I used can be found at https://en.wikipedia.org/wiki/Line–sphere_intersection*/
-intersection_t sphere_intersection(ray_t* ray, void* object_parameters){
+intersection_t sphere_intersector(ray_t* ray, void* object_parameters){
   assert(ray);
   assert(object_parameters);
   
@@ -322,44 +330,44 @@ long mod(long a, long b){
 }
 
 /* bounce the ray and reduce its energy or return sky color */
-vec3d_t ray_hit(ray_t* ray, intersection_t* intersection, img* skybox, double skyheight){
+vec3d_t ray_hit(ray_t* ray, intersection_t* intersection, img* skybox, double skyheight, double skyrad){
   assert(ray);
   assert(intersection);
 
   vec3d_t tmp;
-  double t;
-  long sx, sy;
+  double t, sx, sy;
   pixel p;
   
   if(intersection->did_intersect){
-    // Scooch the ray forward a little bit from the surface
-    // so it doesn't double bounce
-    tmp = v3d_scale(&intersection->normal, 0.000001);
-    ray->origin = v3d_add(&tmp, &intersection->point);
+    if(!intersection->sky){
+      // Scooch the ray forward a little bit from the surface
+      // so it doesn't double bounce
+      tmp = v3d_scale(&intersection->normal, 0.000001);
+      ray->origin = v3d_add(&tmp, &intersection->point);
 
-    // Bounced ray = ray - 2*proj_normal(ray)
-    tmp = v3d_scale(&intersection->normal, -2*v3d_dot(&ray->direction, &intersection->normal));
-    ray->direction = v3d_add(&ray->direction, &tmp);
+      // Bounced ray = ray - 2*proj_normal(ray)
+      tmp = v3d_scale(&intersection->normal, -2*v3d_dot(&ray->direction, &intersection->normal));
+      ray->direction = v3d_add(&ray->direction, &tmp);
 
-    // Reduce ray energy
-    ray->energy.x *= intersection->specular.x;
-    ray->energy.y *= intersection->specular.y;
-    ray->energy.z *= intersection->specular.z;
+      // Reduce ray energy
+      ray->energy = v3d_hadamard(&ray->energy, &intersection->specular);
 
-    return (vec3d_t){0., 0., 0.};
+      return (vec3d_t){0., 0., 0.};
+    } else {
+      t = sqrt(2*skyrad*skyheight - skyheight*skyheight);
+      sx = intersection->point.x, sy = intersection->point.y;
+      sx *= 0.99, sy*= 0.99;
+      sx += t, sy += t;
+      sx /= t*2., sy /= t*2.;
+      sx *= skybox->width - 1, sy *= skybox->height - 1;
+      p = skybox->pix[(int)sy][(int)sx];
+      tmp.x = p.r*1.3, tmp.y = p.g*1.3, tmp.z = p.b*1.4;
+      ray->energy = (vec3d_t){0., 0., 0.};
+      return tmp; 
+    }
   } else {
-    // Sky hit
-    t = (skyheight - ray->origin.z)/ray->direction.z;
-    sx = ray->origin.x + ray->direction.x*t;
-    sy = ray->origin.y + ray->direction.y*t;
-    sx = mod(sx, skybox->width);
-    sy = mod(sy, skybox->height);
-    p = skybox->pix[sy][sx];
-    tmp.x = p.r*1.1;
-    tmp.y = p.g*1.1;
-    tmp.z = p.b*1.1;
     ray->energy = (vec3d_t){0., 0., 0.};
-    return tmp;
+    return (vec3d_t){0.8, 0.8, 0.9};
   }
 }
 
@@ -374,9 +382,11 @@ unsigned char squash(double v){
 
 #define BOUNCE_LIMIT  5
 #define SAMPLES_PER_PIXEL 8
-#define HEIGHT 1000
-#define WIDTH  1000
+#define HEIGHT 1080
+#define WIDTH  1920
 #define SPHERES 21
+#define SKYHEIGHT 1000
+#define SKYRADIUS 10000
 
 int main()
 {
@@ -385,9 +395,10 @@ int main()
   vec3d_t curr_sample;
   ray_t curr_ray;
   intersection_t curr_intersection;
-  scene_object_t scene_objects[SPHERES*SPHERES + 1];
+  scene_object_t scene_objects[SPHERES*SPHERES + 2];
   struct sphere_params sphere_params[SPHERES*SPHERES];
   struct plane_params plane_params;
+  struct sphere_params sky_params;
   int i, iy, y, x, bounce, sample;
   double r, g, b, x_offset[SAMPLES_PER_PIXEL], y_offset[SAMPLES_PER_PIXEL];
   img_ioerr err;
@@ -405,8 +416,9 @@ int main()
     for(x = 0; x < SPHERES; x++){
       i = iy + x;
       scene_objects[i].parameters = (struct sphere_params*)sphere_params + i;
-      scene_objects[i].get_intersection = &sphere_intersection;
+      scene_objects[i].get_intersection = &sphere_intersector;
       scene_objects[i].specular = (vec3d_t){0.8, 0.8, 0.8};
+      scene_objects[i].sky      = false;
 
       sphere_params[i].origin = (vec3d_t){(x-(SPHERES>>1))*120, (y-(SPHERES>>1))*120, 70.};
       sphere_params[i].radius = 45;
@@ -414,10 +426,17 @@ int main()
   }
 
   scene_objects[SPHERES*SPHERES].parameters = &plane_params;
-  scene_objects[SPHERES*SPHERES].get_intersection = &plane_intersection;
+  scene_objects[SPHERES*SPHERES].get_intersection = &plane_intersector;
   scene_objects[SPHERES*SPHERES].specular = (vec3d_t){0.6, 0.6, 0.6};
+  scene_objects[SPHERES*SPHERES].sky = false;
   plane_params.normal = (vec3d_t){0., 0., 1.};
   plane_params.point  = (vec3d_t){0., 0., -10.};
+
+  scene_objects[SPHERES*SPHERES+1].parameters = &sky_params;
+  scene_objects[SPHERES*SPHERES+1].get_intersection = &sphere_intersector;
+  scene_objects[SPHERES*SPHERES+1].sky = true;
+  sky_params.origin = (vec3d_t){0., 0., SKYHEIGHT - SKYRADIUS};
+  sky_params.radius = SKYRADIUS;
 
   tmp = (vec3d_t){50, 50, 200};
   camera = camera_with(&tmp, M_PI/4., 5.*M_PI/4., 0., M_PI/1.5);
@@ -433,14 +452,12 @@ int main()
         curr_sample = (vec3d_t){0., 0., 0.};
         curr_ray = camera_get_ray(&camera, y + y_offset[sample], x + x_offset[sample], HEIGHT, WIDTH);
         for(bounce = 0; bounce < BOUNCE_LIMIT; bounce++){
-          curr_intersection = closest_intersection(&scene_objects[0], SPHERES*SPHERES+1, &curr_ray);
+          curr_intersection = closest_intersection(&scene_objects[0], SPHERES*SPHERES+2, &curr_ray);
           curr_energy = curr_ray.energy;
-          curr_texture = ray_hit(&curr_ray, &curr_intersection, skybox, 400);
-          curr_sample.x += curr_energy.x * curr_texture.x;
-          curr_sample.y += curr_energy.y * curr_texture.y;
-          curr_sample.z += curr_energy.z * curr_texture.z;
+          curr_texture = ray_hit(&curr_ray, &curr_intersection, skybox, SKYHEIGHT, SKYRADIUS);
+          curr_sample = v3d_hadamard(&curr_energy, &curr_texture);
 
-          if(!curr_intersection.did_intersect){
+          if(!curr_intersection.did_intersect || curr_intersection.sky){
             break;
           }
         }

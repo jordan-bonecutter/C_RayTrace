@@ -34,6 +34,20 @@ vec3d_t v3d_scale(vec3d_t* v, double s){
   return ret;
 }
 
+vec3d_t v3d_hadamard(vec3d_t* v1, vec3d_t* v2){
+  assert(v1);
+  assert(v2);
+
+  vec3d_t ret;
+
+  /* hadamard product */
+  ret.x = v1->x * v2->x;
+  ret.y = v1->y * v2->y;
+  ret.z = v1->z * v2->z;
+
+  return ret;
+}
+
 double v3d_dot(vec3d_t* v1, vec3d_t* v2){
   assert(v1);
   assert(v2);

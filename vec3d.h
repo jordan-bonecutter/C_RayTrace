@@ -13,6 +13,7 @@ typedef struct{
 
 vec3d_t v3d_add(vec3d_t* v1, vec3d_t* v2);
 vec3d_t v3d_scale(vec3d_t* v, double s);
+vec3d_t v3d_hadamard(vec3d_t* v1, vec3d_t* v2);
 double  v3d_dot(vec3d_t* v1, vec3d_t* v2);
 
 #endif
