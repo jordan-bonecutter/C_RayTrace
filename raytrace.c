@@ -22,7 +22,7 @@
  *  */
 typedef struct{
   vec3d_t origin, i, j, k;
-  double fov;
+  double fov, flen, lens_radius, d;
 } camera_t;
 
 /* intersection struct:
@@ -224,13 +224,16 @@ intersection_t sphere_intersector(ray_t* ray, void* object_parameters){
  * phi pans the camera side to side
  * alpha twists the camera clockwise 
  * fov is the vertical angle which the camera captures */
-camera_t camera_with(vec3d_t* origin, double theta, double phi, double alpha, double fov){
+camera_t camera_with(vec3d_t* origin, double theta, double phi, double alpha, double fov, double flen, double lens_rad, double plane){
   assert(origin);
   
   camera_t ret;
 
-  ret.origin = *origin;
-  ret.fov    = fov;
+  ret.origin      = *origin;
+  ret.fov         = fov;
+  ret.flen        = flen;
+  ret.lens_radius = lens_rad;
+  ret.d           = 1./((1./flen - 1./plane));
 
   /* divide by two because of
    * our quaternion based algorithm */
@@ -321,6 +324,20 @@ ray_t camera_get_ray(camera_t* camera, double y, double x, int height, int width
   return ray;
 }
 
+double camera_get_smear(camera_t* camera, vec3d_t* point){
+  assert(camera);
+  assert(point);
+
+  double orth_dist, proj_dist;
+  vec3d_t tmp;
+  tmp = v3d_scale(point, -1.);
+  tmp = v3d_add(&tmp, &camera->origin);
+  orth_dist = fabs(v3d_dot(&tmp, &camera->i));
+  orth_dist = sqrt(v3d_dot(&tmp, &tmp));
+  proj_dist = 1./((1./camera->flen) - (1./orth_dist));
+  return camera->lens_radius*fabs(proj_dist);
+}
+
 long mod(long a, long b){
   if(a < 0){
     return (a%b) + b - 1;
@@ -378,21 +395,88 @@ unsigned char squash(double v){
   return (unsigned char)v;
 }
 
+vec3d_t** alloc_double(int width, int height){
+  int i;
+  vec3d_t** ret = malloc(sizeof(vec3d_t*)*height);
+  ret[0] = calloc(sizeof(vec3d_t), width*height);
+
+  for(i = 1; i < height; ret[i] = ret[i-1] + width, i++);
+  return ret;
+}
+
+void free_double(vec3d_t** a){
+  free(a[0]);
+  free(a);
+}
+
+void draw_smeared(vec3d_t** array, int cx, int cy, int width, int height, double dsmear, vec3d_t* color){
+  int smear = 7*fabs(dsmear)+1;
+  int dy, dx, y, x, count = 0;
+  vec3d_t tmp;
+
+  array[cy][cx] = (vec3d_t){squash(smear), squash(smear), squash(smear), 255};
+  return;
+  
+  for(dy = -smear; dy < smear; dy++){
+    y = cy + dy;
+    for(dx = -smear; dx < smear; dx++){
+      x = cx + dx;
+      if(dx*dx + dy*dy <= smear*smear){
+        count++;
+      }
+    }
+  }
+  
+  for(dy = -smear; dy < smear; dy++){
+    y = cy + dy;
+    if(y < 0 || y > height-1){
+      continue;
+    }
+    for(dx = -smear; dx < smear; dx++){
+      x = cx + dx;
+      if(x < 0 || x > width - 1 || dx*dx + dy*dy > smear*smear){
+        continue;
+      }
+      tmp = v3d_scale(color, 1./count);
+      array[y][x] = v3d_add(array[y] + x, &tmp);
+    }
+  }
+}
+
+void dbl2uchar(vec3d_t** dimg, img* uchar, int width, int height){
+  int x, y;
+  pixel p;
+  vec3d_t curr;
+
+  for(y = 0; y < height; y++){
+    for(x = 0; x < width; x++){
+      curr = dimg[y][x];
+      p.r = squash(curr.x);
+      p.g = squash(curr.y);
+      p.b = squash(curr.z);
+      p.a = 255;
+
+      uchar->pix[y][x] = p;
+    }
+  }
+}
+
 /* Hot damn, this part's a mess! Hopefully I can clean it up :) */
 
 #define BOUNCE_LIMIT  5
-#define SAMPLES_PER_PIXEL 8
-#define HEIGHT 1080
-#define WIDTH  1920
+#define SAMPLES_PER_PIXEL 5
+#define HEIGHT 500
+#define WIDTH  500
 #define SPHERES 21
 #define SKYHEIGHT 1000
 #define SKYRADIUS 10000
+
 
 int main()
 {
   camera_t camera;
   vec3d_t tmp, curr_energy, curr_texture;
-  vec3d_t curr_sample;
+  vec3d_t curr_sample, color;
   ray_t curr_ray;
   intersection_t curr_intersection;
   scene_object_t scene_objects[SPHERES*SPHERES + 2];
@@ -400,7 +484,8 @@ int main()
   struct plane_params plane_params;
   struct sphere_params sky_params;
   int i, iy, y, x, bounce, sample;
-  double r, g, b, x_offset[SAMPLES_PER_PIXEL], y_offset[SAMPLES_PER_PIXEL];
+  double x_offset[SAMPLES_PER_PIXEL], y_offset[SAMPLES_PER_PIXEL], smear;
+  vec3d_t** dimg = alloc_double(WIDTH, HEIGHT);
   img_ioerr err;
   img* skybox = img_from_png("skybox.png", &err);
 
@@ -439,7 +524,7 @@ int main()
   sky_params.radius = SKYRADIUS;
 
   tmp = (vec3d_t){50, 50, 200};
-  camera = camera_with(&tmp, M_PI/4., 5.*M_PI/4., 0., M_PI/1.5);
+  camera = camera_with(&tmp, M_PI/4., 5.*M_PI/4., 0., M_PI/1.5, 150, 1, 200);
 
   printf("camera.i = (%lf, %lf, %lf)\n", camera.i.x, camera.i.y, camera.i.z);
   printf("camera.j = (%lf, %lf, %lf)\n", camera.j.x, camera.j.y, camera.j.z);
@@ -447,12 +532,15 @@ int main()
 
   for(y = 0; y < HEIGHT; y++){
     for(x = 0; x < WIDTH; x++){
-      r = 0, g = 0, b = 0;
+      color = (vec3d_t){0., 0., 0.};
       for(sample = 0; sample < SAMPLES_PER_PIXEL; sample++){
         curr_sample = (vec3d_t){0., 0., 0.};
         curr_ray = camera_get_ray(&camera, y + y_offset[sample], x + x_offset[sample], HEIGHT, WIDTH);
         for(bounce = 0; bounce < BOUNCE_LIMIT; bounce++){
           curr_intersection = closest_intersection(&scene_objects[0], SPHERES*SPHERES+2, &curr_ray);
+          if(bounce == 0){
+            smear = camera_get_smear(&camera, &curr_intersection.point);
+          }
           curr_energy = curr_ray.energy;
           curr_texture = ray_hit(&curr_ray, &curr_intersection, skybox, SKYHEIGHT, SKYRADIUS);
           curr_sample = v3d_hadamard(&curr_energy, &curr_texture);
@@ -461,16 +549,20 @@ int main()
             break;
           }
         }
-        r += curr_sample.x/SAMPLES_PER_PIXEL;
-        g += curr_sample.y/SAMPLES_PER_PIXEL;
-        b += curr_sample.z/SAMPLES_PER_PIXEL;
+        color.x += curr_sample.x/SAMPLES_PER_PIXEL;
+        color.y += curr_sample.y/SAMPLES_PER_PIXEL;
+        color.z += curr_sample.z/SAMPLES_PER_PIXEL;
       }  
-      image->pix[y][x] = (pixel){squash(r), squash(g), squash(b), 255};
+      draw_smeared(dimg, x, y, WIDTH, HEIGHT, smear, &color);
+      //image->pix[y][x] = (pixel){squash(color.x), squash(color.y), squash(color.z), 255};
     }
   }
 
+  dbl2uchar(dimg, image, WIDTH, HEIGHT);
   (void)img_save_to_png(image, "test.png");
   img_free(image);
+  img_free(skybox);
+  free_double(dimg);
 
   return 0;
 }
