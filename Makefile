@@ -7,7 +7,7 @@
 
 LOPENIP = ~/Desktop/my_include/openip/libopenip.a /usr/local/opt/libjpeg-turbo/lib/libturbojpeg.a -lpng
 COMPILER = gcc
-OPTIMIZATION = -Ofast
+OPTIMIZATION = -O0 -g
 FLAGS = -ansi -std=c99 -Wall $(OPTIMIZATION)
 CC = $(COMPILER) $(FLAGS)
 CO = $(CC) -c
