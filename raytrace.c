@@ -13,17 +13,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <openip.h>
+#include <pthread.h>
 
-/* camera struct:
- *  origin: camera location
- *  i: camera forward vector
- *  j: camera right vector
- *  k: camera up vector
- *  */
-typedef struct{
-  vec3d_t origin, i, j, k;
-  double fov, flen, lens_radius, d;
-} camera_t;
+typedef struct _scene_object_ scene_object_t;
 
 /* intersection struct:
  *  did_intersect: true if the ray meets object, false otherwise
@@ -34,6 +26,7 @@ typedef struct{
 typedef struct{
   bool did_intersect, sky;
   vec3d_t point, normal, specular; 
+  scene_object_t* object;
 } intersection_t;
 
 /* ray struct:
@@ -72,12 +65,68 @@ typedef vec3d_t (*object_texturemap)(vec3d_t* object_point, void* object_paramet
  *  define a new object_params struct which parameters points to. 
  *  You also need to write an intersection function so that you
  *  can do intersection tests.*/
-typedef struct{
+struct _scene_object_{
   void* parameters;
   object_intersector get_intersection;
   vec3d_t specular;
   bool sky;
-} scene_object_t;
+};
+
+/* scene struct:
+ *  scene_objects: list of all scene objects
+ *  n_scene_objects: number of scene objects in list
+ *  */
+typedef struct{
+  scene_object_t* scene_objects;
+  int n_scene_objects;
+}scene_t;
+
+/* render_sheet_t:
+ *  iplane: image plane
+ *  width, height: plane width & height in pixels
+ *  */
+typedef struct{
+  vec3d_t** iplane;
+  int width, height;
+}render_sheet_t;
+
+/* camera struct:
+ *  origin: camera location
+ *  i: camera forward vector
+ *  j: camera right vector
+ *  k: camera up vector
+ *  */
+typedef struct{
+  vec3d_t origin, i, j, k;
+  double fov;
+  void* params;
+} camera_t;
+
+typedef struct{
+  int samples_per_pixel, bounce_limit;
+} render_params_t;
+
+/* camera_bokeh_params struct:
+ *  flen: focal length of camera lens
+ *  fplane: focal plane distance from camera
+ *  lrad: lens radius size
+ *  */
+struct camera_bokeh_params{
+  double flen, fplane, lrad;
+};
+
+/* method for rendering a scene */
+typedef void (*scene_renderer)(scene_t*, camera_t*, render_sheet_t*, render_params_t*);
+
+/* render struct:
+ *  camera: camera used to render
+ *  scene: scene to capture
+ *  renderer: */
+typedef struct{
+  camera_t camera;
+  scene_t scene;
+  scene_renderer renderer;
+} render_t;
 
 /* sphere_params struct:
  *  origin: sphere center
@@ -86,6 +135,12 @@ typedef struct{
 struct sphere_params{
   vec3d_t origin;
   double radius;
+};
+
+struct sky_params{
+  vec3d_t origin;
+  double radius, height;
+  img* skybox;
 };
 
 /* plane_params struct:
@@ -97,10 +152,18 @@ struct plane_params{
   vec3d_t normal;
 };
 
+struct thread_params{
+  scene_t* scene;
+  camera_t* camera;
+  render_sheet_t* sheet;
+  int tid, total;
+  render_params_t* params;
+};
+
 /* takes in a list of all scene objects and returns the closest intersection */
 // TODO: add  scene struct and make this function take in only the scene
-intersection_t closest_intersection(scene_object_t* scene_objects, int N, ray_t* ray){
-  assert(scene_objects);
+intersection_t closest_intersection(scene_t* scene, ray_t* ray){
+  assert(scene);
   assert(ray);
 
   int i;
@@ -111,20 +174,20 @@ intersection_t closest_intersection(scene_object_t* scene_objects, int N, ray_t*
 
   // Loop through each intersection and return the one that happened closest to the
   // origin of the current ray
-  for(i = 0; i < N; i++){
-    curr_intersect = scene_objects[i].get_intersection(ray, scene_objects[i].parameters);
+  for(i = 0; i < scene->n_scene_objects; i++){
+    curr_intersect = scene->scene_objects[i].get_intersection(ray, scene->scene_objects[i].parameters);
     if(!curr_intersect.did_intersect){
       continue;
     }
-    tmp = v3d_scale(&ray->origin, -1.);
-    tmp = v3d_add(&tmp, &curr_intersect.point);
+    v3d_sub(&curr_intersect.point, &ray->origin, &tmp);
     curr_dist = v3d_dot(&tmp, &tmp);
 
     if(curr_dist < mindist){
       mindist = curr_dist;
       ret = curr_intersect;
-      ret.specular = scene_objects[i].specular;
-      ret.sky = scene_objects[i].sky;
+      ret.specular = scene->scene_objects[i].specular;
+      ret.sky = scene->scene_objects[i].sky;
+      ret.object = scene->scene_objects + i;
     }
   }
 
@@ -142,8 +205,7 @@ intersection_t plane_intersector(ray_t* ray, void* object_parameters){
   vec3d_t tmp;
   struct plane_params* plane = (struct plane_params*)object_parameters;
 
-  tmp = v3d_scale(&ray->origin, -1.);
-  tmp = v3d_add(&plane->point, &tmp);
+  v3d_sub(&plane->point, &ray->origin, &tmp);
   numerator = v3d_dot(&tmp, &plane->normal);
   denominator = v3d_dot(&ray->direction, &plane->normal);
 
@@ -158,8 +220,8 @@ intersection_t plane_intersector(ray_t* ray, void* object_parameters){
   }
 
   ret.did_intersect = true;
-  tmp = v3d_scale(&ray->direction, t);
-  ret.point = v3d_add(&ray->origin, &tmp);
+  v3d_scale(&ray->direction, t, &tmp);
+  v3d_add(&ray->origin, &tmp, &ret.point);
   ret.normal = plane->normal;
 
   return ret;
@@ -172,11 +234,10 @@ intersection_t sphere_intersector(ray_t* ray, void* object_parameters){
   assert(object_parameters);
   
   intersection_t ret;
-  double determinant, offset, t, normal_scale;
+  double determinant, offset, t;
   struct sphere_params* sphere = (struct sphere_params*)object_parameters;
-  vec3d_t tmp;
-  tmp = v3d_scale(&sphere->origin, -1.);
-  vec3d_t diff = v3d_add(&ray->origin, &tmp);
+  vec3d_t tmp, diff;
+  v3d_sub(&ray->origin, &sphere->origin, &diff);
   
   determinant = v3d_dot(&ray->direction, &diff);
   determinant *= determinant;
@@ -192,13 +253,11 @@ intersection_t sphere_intersector(ray_t* ray, void* object_parameters){
   t = offset - determinant;
   if(t > 0){
     ret.did_intersect = true;
-    tmp = v3d_scale(&ray->direction, t);
-    ret.point = v3d_add(&ray->origin, &tmp);
+    v3d_scale(&ray->direction, t, &tmp);
+    v3d_add(&ray->origin, &tmp, &ret.point);
 
-    tmp = v3d_scale(&sphere->origin, -1.);
-    ret.normal = v3d_add(&ret.point, &tmp);
-    normal_scale = sqrt(v3d_dot(&ret.normal, &ret.normal));
-    ret.normal = v3d_scale(&ret.normal, 1./normal_scale);
+    v3d_sub(&ret.point, &sphere->origin, &ret.normal);
+    v3d_normalize(&ret.normal);
   } else {
     t = offset + determinant;
     if (t < 0)
@@ -207,13 +266,11 @@ intersection_t sphere_intersector(ray_t* ray, void* object_parameters){
       return ret;
     } 
     ret.did_intersect = true;
-    tmp = v3d_scale(&ray->direction, t);
-    ret.point = v3d_add(&ray->origin, &tmp);
+    v3d_scale(&ray->direction, t, &tmp);
+    v3d_add(&ray->origin, &tmp, &ret.point);
 
-    tmp = v3d_scale(&sphere->origin, -1.);
-    ret.normal = v3d_add(&ret.point, &tmp);
-    normal_scale = sqrt(v3d_dot(&ret.normal, &ret.normal));
-    ret.normal = v3d_scale(&ret.normal, 1./normal_scale);
+    v3d_sub(&ret.point, &sphere->origin, &ret.normal);
+    v3d_normalize(&ret.normal);
   }
 
   return ret;
@@ -224,16 +281,13 @@ intersection_t sphere_intersector(ray_t* ray, void* object_parameters){
  * phi pans the camera side to side
  * alpha twists the camera clockwise 
  * fov is the vertical angle which the camera captures */
-camera_t camera_with(vec3d_t* origin, double theta, double phi, double alpha, double fov, double flen, double lens_rad, double plane){
+camera_t camera_with(vec3d_t* origin, double theta, double phi, double alpha, double fov){
   assert(origin);
   
   camera_t ret;
 
   ret.origin      = *origin;
   ret.fov         = fov;
-  ret.flen        = flen;
-  ret.lens_radius = lens_rad;
-  ret.d           = 1./((1./flen - 1./plane));
 
   /* divide by two because of
    * our quaternion based algorithm */
@@ -296,6 +350,38 @@ camera_t camera_with(vec3d_t* origin, double theta, double phi, double alpha, do
   return ret;
 }
 
+camera_t camera_bokeh_with(vec3d_t* origin, double theta, double phi, double alpha, double fov, double flen, double fplane, double lrad){
+  camera_t ret = camera_with(origin, theta, phi, alpha, fov);
+  static struct camera_bokeh_params params;
+  params.flen = flen, params.fplane = fplane, params.lrad = lrad;
+  ret.params = &params;
+
+  return ret;
+}
+
+ray_t camera_get_bokeh_ray(camera_t* camera, vec3d_t* point, vec3d_t* normal, int dx, int dy, double smear){
+  assert(camera);
+  
+  ray_t ray;
+  vec3d_t lenspoint, vdx, vdy, tmp;
+  double fx, fy;
+  struct camera_bokeh_params* bokeh = (struct camera_bokeh_params*)camera->params;
+
+  fx = ((double)dx)/smear;
+  fy = ((double)dy)/smear;
+
+  v3d_scale(&camera->j, bokeh->lrad*fx, &vdx);
+  v3d_scale(&camera->k, bokeh->lrad*fy, &vdy);
+  v3d_add(&camera->origin, &vdx, &lenspoint);
+  v3d_add(&lenspoint, &vdy, &lenspoint);
+  v3d_sub(&lenspoint, point, &ray.direction);
+  v3d_normalize(&ray.direction);
+  v3d_scale(normal, 0.00001, &tmp);
+  v3d_add(&tmp, point, &ray.origin);
+
+  return ray;
+}
+
 /* get the ray originating at the camera passing through image plane point x, y */
 ray_t camera_get_ray(camera_t* camera, double y, double x, int height, int width){
   assert(camera);
@@ -310,32 +396,32 @@ ray_t camera_get_ray(camera_t* camera, double y, double x, int height, int width
   y = height/2. - y;
   x -= width/2.;
 
-  ret = v3d_scale(&camera->i, l);
-  tmp = v3d_scale(&camera->k, y);
-  ret = v3d_add(&ret, &tmp);
-  tmp = v3d_scale(&camera->j, x);
-  ret = v3d_add(&ret, &tmp);
+  v3d_scale(&camera->i, l, &ret);
+  v3d_scale(&camera->k, y, &tmp);
+  v3d_add(&ret, &tmp, &ret);
+  v3d_scale(&camera->j, x, &tmp);
+  v3d_add(&ret, &tmp, &ret);
 
-  l = sqrt(v3d_dot(&ret, &ret));
-  ray.direction = v3d_scale(&ret, 1./l);
+  v3d_normalize(&ret);
   ray.origin = camera->origin;
   ray.energy = (vec3d_t){1., 1., 1.};
+  ray.direction = ret;
 
   return ray;
 }
 
-double camera_get_smear(camera_t* camera, vec3d_t* point){
+double camera_bokeh_get_smear(camera_t* camera, vec3d_t* point){
   assert(camera);
   assert(point);
 
+  struct camera_bokeh_params* bokeh = (struct camera_bokeh_params*)camera->params;
+
   double orth_dist, proj_dist;
   vec3d_t tmp;
-  tmp = v3d_scale(point, -1.);
-  tmp = v3d_add(&tmp, &camera->origin);
-  orth_dist = fabs(v3d_dot(&tmp, &camera->i));
-  orth_dist = sqrt(v3d_dot(&tmp, &tmp));
-  proj_dist = 1./((1./camera->flen) - (1./orth_dist));
-  return camera->lens_radius*fabs(proj_dist);
+  v3d_sub(point, &camera->origin, &tmp);
+  orth_dist = v3d_dot(&tmp, &camera->i);
+  proj_dist = 1./((1./bokeh->flen) - (1./orth_dist));
+  return fabs((bokeh->lrad/proj_dist)*(proj_dist - 1./((1./bokeh->flen) - (1./bokeh->fplane))));
 }
 
 long mod(long a, long b){
@@ -347,30 +433,36 @@ long mod(long a, long b){
 }
 
 /* bounce the ray and reduce its energy or return sky color */
-vec3d_t ray_hit(ray_t* ray, intersection_t* intersection, img* skybox, double skyheight, double skyrad){
+vec3d_t ray_hit(ray_t* ray, intersection_t* intersection){
   assert(ray);
   assert(intersection);
 
   vec3d_t tmp;
-  double t, sx, sy;
+  double t, sx, sy, skyrad, skyheight;
   pixel p;
+  img* skybox;
+  struct sky_params* sky_params;
   
   if(intersection->did_intersect){
     if(!intersection->sky){
       // Scooch the ray forward a little bit from the surface
       // so it doesn't double bounce
-      tmp = v3d_scale(&intersection->normal, 0.000001);
-      ray->origin = v3d_add(&tmp, &intersection->point);
+      v3d_scale(&intersection->normal, 0.000001, &tmp);
+      v3d_add(&tmp, &intersection->point, &ray->origin);
 
       // Bounced ray = ray - 2*proj_normal(ray)
-      tmp = v3d_scale(&intersection->normal, -2*v3d_dot(&ray->direction, &intersection->normal));
-      ray->direction = v3d_add(&ray->direction, &tmp);
+      v3d_scale(&intersection->normal, -2*v3d_dot(&ray->direction, &intersection->normal), &tmp);
+      v3d_add(&ray->direction, &tmp, &ray->direction);
 
       // Reduce ray energy
-      ray->energy = v3d_hadamard(&ray->energy, &intersection->specular);
+      v3d_hadamard(&ray->energy, &intersection->specular, &ray->energy);
 
       return (vec3d_t){0., 0., 0.};
     } else {
+      sky_params = (struct sky_params*)intersection->object->parameters;
+      skyrad = sky_params->radius;
+      skyheight = sky_params->height;
+      skybox = sky_params->skybox;
       t = sqrt(2*skyrad*skyheight - skyheight*skyheight);
       sx = intersection->point.x, sy = intersection->point.y;
       sx *= 0.99, sy*= 0.99;
@@ -414,7 +506,7 @@ void draw_smeared(vec3d_t** array, int cx, int cy, int width, int height, double
   int dy, dx, y, x, count = 0;
   vec3d_t tmp;
 
-  array[cy][cx] = (vec3d_t){squash(smear), squash(smear), squash(smear), 255};
+  array[cy][cx] = (vec3d_t){squash(color->x), squash(color->y), squash(color->z)};
   return;
   
   for(dy = -smear; dy < smear; dy++){
@@ -437,20 +529,20 @@ void draw_smeared(vec3d_t** array, int cx, int cy, int width, int height, double
       if(x < 0 || x > width - 1 || dx*dx + dy*dy > smear*smear){
         continue;
       }
-      tmp = v3d_scale(color, 1./count);
-      array[y][x] = v3d_add(array[y] + x, &tmp);
+      v3d_scale(color, 1./count, &tmp);
+      v3d_add(array[y] + x, &tmp, array[y] + x);
     }
   }
 }
 
-void dbl2uchar(vec3d_t** dimg, img* uchar, int width, int height){
+void sheet2uchar(render_sheet_t* sheet, img* uchar, int width, int height){
   int x, y;
   pixel p;
   vec3d_t curr;
 
   for(y = 0; y < height; y++){
     for(x = 0; x < width; x++){
-      curr = dimg[y][x];
+      curr = sheet->iplane[y][x];
       p.r = squash(curr.x);
       p.g = squash(curr.y);
       p.b = squash(curr.z);
@@ -461,12 +553,392 @@ void dbl2uchar(vec3d_t** dimg, img* uchar, int width, int height){
   }
 }
 
-/* Hot damn, this part's a mess! Hopefully I can clean it up :) */
+double circle_spread(int radius){
+  int count = 0, y, x;
+  for(y = -radius; y <= radius; y++){
+    for(x = -radius; x <= radius; x++){
+      if(x*x + y*y <= radius*radius){
+        count++;
+      }
+    }
+  }
+
+  return 1./count;
+}
+
+double max(double v1, double v2){
+  return v1 > v2 ? v1 : v2;
+}
+
+double min(double v1, double v2){
+  return v1 < v2 ? v1 : v2;
+}
+
+void* bokeh_threadfunc(void* params){
+  assert(params);
+
+  struct thread_params* thread_params = (struct thread_params*)params;
+  scene_t* scene = thread_params->scene;
+  camera_t* camera = thread_params->camera;
+  render_sheet_t* sheet = thread_params->sheet;
+  int tid = thread_params->tid, total = thread_params->total;
+  render_params_t* r_params = thread_params->params;
+
+  int i, y, x, dx, dy, sample, height, width, bounce;
+  double* y_offset, *x_offset, weight, percent;
+  double smear, xl, xu, yl, yu;
+  vec3d_t tmp, color, curr_sample, curr_energy, curr_texture, bounce_point, bounce_normal;
+  ray_t curr_ray;
+  intersection_t curr_intersection;
+  struct camera_bokeh_params* bokeh = (struct camera_bokeh_params*)camera->params;
+
+  y_offset = malloc(sizeof(double)*r_params->samples_per_pixel);
+  x_offset = malloc(sizeof(double)*r_params->samples_per_pixel);
+
+  for(i = 0; i < r_params->samples_per_pixel; i++){
+    x_offset[i] = 0.5*cos(2.*M_PI*i/r_params->samples_per_pixel);
+    y_offset[i] = 0.5*sin(2.*M_PI*i/r_params->samples_per_pixel);
+  }
+
+  height = sheet->height;
+  width  = sheet->width;
+  
+  for(y = tid; y < sheet->height; y += total){
+    for(x = 0; x < width; x++){
+      fflush(stdout);
+      color = (vec3d_t){0., 0., 0.};
+      for(sample = 0; sample < r_params->samples_per_pixel; sample++){
+        curr_sample = (vec3d_t){0., 0., 0.};
+        curr_ray = camera_get_ray(camera, y + y_offset[sample], x + x_offset[sample], height, width);
+
+        for(bounce = 0; bounce < r_params->bounce_limit; bounce++){
+          curr_intersection = closest_intersection(scene, &curr_ray);
+          if(bounce == 0){
+            smear = camera_bokeh_get_smear(camera, &curr_intersection.point);
+            bounce_point = curr_intersection.point;
+            bounce_normal = curr_intersection.normal;
+          } 
+          curr_energy = curr_ray.energy;
+          curr_texture = ray_hit(&curr_ray, &curr_intersection);
+          v3d_hadamard(&curr_energy, &curr_texture, &curr_sample);
+
+          if(!curr_intersection.did_intersect || curr_intersection.sky){
+            break;
+          }
+        }
+        v3d_scale(&curr_sample, 1./r_params->samples_per_pixel, &color);
+        smear = smear < 0.25 ? 0.25 : smear;
+        weight = 1./(4*smear*smear);
+        v3d_scale(&color, 1./(4*smear*smear), &color);
+        for(dy = -(smear+1); dy <= (smear+1); dy++){
+          if(y + dy < 0 || y + dy >= height){
+            continue;
+          }
+          for(dx = -(smear+1); dx <= (smear+1); dx++){
+            if(x + dx < 0 || x + dx >= width){
+              continue;
+            }
+            if(abs(dx) - smear > 0.5 || abs(dy) - smear > 0.5){
+              continue;
+            }
+            xl = min(x + dx + 0.5, x + smear);
+            xu = max(x + dx - 0.5, x - smear);
+            yl = min(y + dy + 0.5, y + smear);
+            yu = max(y + dy - 0.5, y - smear);
+            curr_ray = camera_get_bokeh_ray(camera, &bounce_point, &bounce_normal, dx, dy, smear);
+            curr_intersection = closest_intersection(scene, &curr_ray);
+            if((!curr_intersection.did_intersect || curr_intersection.sky)){
+              v3d_scale(&color, (xl - xu)*(yl - yu), &tmp);
+              v3d_add(&sheet->iplane[dy + y][dx + x], &tmp, &sheet->iplane[dy + y][dx + x]);
+            }
+          }
+        }
+      }  
+    }
+  }
+
+  free(y_offset);
+  free(x_offset);
+
+  return NULL;
+}
+
+void bokeh_renderer_multithread(scene_t* scene, camera_t* camera, render_sheet_t* sheet, render_params_t* r_params, int n_threads){
+  int i;
+  pthread_t* threads;
+  threads = malloc(sizeof(pthread_t)*(n_threads-1));
+  struct thread_params* thread_params;
+  thread_params = malloc(sizeof(struct thread_params)*n_threads);
+  double curr, prev;
+
+  prev = 0.;
+  for(i = 0; i < n_threads-1; i++){
+    curr = prev + sheet->height/(double)n_threads;
+    thread_params[i].scene = scene;
+    thread_params[i].camera = camera;
+    thread_params[i].sheet = sheet;
+    thread_params[i].tid = i;
+    thread_params[i].total = n_threads;
+    thread_params[i].params = r_params;
+    pthread_create(threads + i, NULL, bokeh_threadfunc, &thread_params[i]);
+    prev = curr;
+  }
+
+  curr = prev + sheet->height/(double)n_threads;
+  thread_params[n_threads-1].scene = scene;
+  thread_params[n_threads-1].camera = camera;
+  thread_params[n_threads-1].sheet = sheet;
+  thread_params[n_threads-1].tid = n_threads - 1;
+  thread_params[n_threads-1].total = n_threads;
+  thread_params[n_threads-1].params = r_params;
+  bokeh_threadfunc(thread_params + n_threads - 1);
+
+  for(i = 0; i < n_threads-1; i++){
+    pthread_join(threads[i], NULL);
+  }
+
+  free(threads);
+  free(thread_params);
+}
+
+void bokeh_renderer(scene_t* scene, camera_t* camera, render_sheet_t* sheet, render_params_t* r_params){
+  int i, y, x, dx, dy, sample, height, width, bounce;
+  double* y_offset, *x_offset, weight, percent;
+  double smear, xl, xu, yl, yu;
+  vec3d_t tmp, color, curr_sample, curr_energy, curr_texture, bounce_point, bounce_normal;
+  ray_t curr_ray;
+  intersection_t curr_intersection;
+  struct camera_bokeh_params* bokeh = (struct camera_bokeh_params*)camera->params;
+
+  y_offset = malloc(sizeof(double)*r_params->samples_per_pixel);
+  x_offset = malloc(sizeof(double)*r_params->samples_per_pixel);
+
+  for(i = 0; i < r_params->samples_per_pixel; i++){
+    x_offset[i] = 0.5*cos(2.*M_PI*i/r_params->samples_per_pixel);
+    y_offset[i] = 0.5*sin(2.*M_PI*i/r_params->samples_per_pixel);
+  }
+
+  height = sheet->height;
+  width  = sheet->width;
+  
+  for(y = 0; y < height; y++){
+    for(x = 0; x < width; x++){
+      printf("\r%lf", (y*width + x)/((double)height*width));
+      fflush(stdout);
+      color = (vec3d_t){0., 0., 0.};
+      for(sample = 0; sample < r_params->samples_per_pixel; sample++){
+        curr_sample = (vec3d_t){0., 0., 0.};
+        curr_ray = camera_get_ray(camera, y + y_offset[sample], x + x_offset[sample], height, width);
+
+        for(bounce = 0; bounce < r_params->bounce_limit; bounce++){
+          curr_intersection = closest_intersection(scene, &curr_ray);
+          if(bounce == 0){
+            smear = camera_bokeh_get_smear(camera, &curr_intersection.point);
+            bounce_point = curr_intersection.point;
+            bounce_normal = curr_intersection.normal;
+          } 
+          curr_energy = curr_ray.energy;
+          curr_texture = ray_hit(&curr_ray, &curr_intersection);
+          v3d_hadamard(&curr_energy, &curr_texture, &curr_sample);
+
+          if(!curr_intersection.did_intersect || curr_intersection.sky){
+            break;
+          }
+        }
+        v3d_scale(&curr_sample, 1./r_params->samples_per_pixel, &color);
+        smear = smear < 0.25 ? 0.25 : smear;
+        weight = 1./(4*smear*smear);
+        v3d_scale(&color, 1./(4*smear*smear), &color);
+        for(dy = -(smear+1); dy <= (smear+1); dy++){
+          if(y + dy < 0 || y + dy >= height){
+            continue;
+          }
+          for(dx = -(smear+1); dx <= (smear+1); dx++){
+            if(x + dx < 0 || x + dx >= width){
+              continue;
+            }
+            if(abs(dx) - smear > 0.5 || abs(dy) - smear > 0.5){
+              continue;
+            }
+            xl = min(x + dx + 0.5, x + smear);
+            xu = max(x + dx - 0.5, x - smear);
+            yl = min(y + dy + 0.5, y + smear);
+            yu = max(y + dy - 0.5, y - smear);
+            curr_ray = camera_get_bokeh_ray(camera, &bounce_point, &bounce_normal, dx, dy, smear);
+            curr_intersection = closest_intersection(scene, &curr_ray);
+            if((!curr_intersection.did_intersect || curr_intersection.sky)){
+              v3d_scale(&color, (xl - xu)*(yl - yu), &tmp);
+              v3d_add(&sheet->iplane[dy + y][dx + x], &tmp, &sheet->iplane[dy + y][dx + x]);
+            }
+          }
+        }
+      }  
+    }
+  }
+
+  free(y_offset);
+  free(x_offset);
+}
+
+void* default_threadfunc(void* data){
+  struct thread_params* thread_params = (struct thread_params*)data;
+  scene_t* scene = thread_params->scene;
+  camera_t* camera = thread_params->camera;
+  render_sheet_t* sheet = thread_params->sheet;
+  int tid = thread_params->tid, total = thread_params->total;
+  render_params_t* r_params = thread_params->params;
+
+  int i, y, x, sample, height, width, bounce;
+  double* y_offset, *x_offset;
+  vec3d_t color, curr_sample, curr_energy, curr_texture;
+  ray_t curr_ray;
+  intersection_t curr_intersection;
+
+  y_offset = malloc(sizeof(double)*r_params->samples_per_pixel);
+  x_offset = malloc(sizeof(double)*r_params->samples_per_pixel);
+
+  for(i = 0; i < r_params->samples_per_pixel; i++){
+    x_offset[i] = 0.5*cos(2.*M_PI*i/r_params->samples_per_pixel);
+    y_offset[i] = 0.5*sin(2.*M_PI*i/r_params->samples_per_pixel);
+  }
+
+  height = sheet->height;
+  width  = sheet->width;
+  
+  for(y = tid; y < height; y += total){
+    for(x = 0; x < width; x++){
+      color = (vec3d_t){0., 0., 0.};
+      for(sample = 0; sample < r_params->samples_per_pixel; sample++){
+        curr_sample = (vec3d_t){0., 0., 0.};
+        curr_ray = camera_get_ray(camera, y + y_offset[sample], x + x_offset[sample], height, width);
+
+        for(bounce = 0; bounce < r_params->bounce_limit; bounce++){
+          curr_intersection = closest_intersection(scene, &curr_ray);
+          curr_energy = curr_ray.energy;
+          curr_texture = ray_hit(&curr_ray, &curr_intersection);
+          v3d_hadamard(&curr_energy, &curr_texture, &curr_sample);
+
+          if(!curr_intersection.did_intersect || curr_intersection.sky){
+            break;
+          }
+        }
+        color.x += curr_sample.x/r_params->samples_per_pixel;
+        color.y += curr_sample.y/r_params->samples_per_pixel;
+        color.z += curr_sample.z/r_params->samples_per_pixel;
+      }  
+      sheet->iplane[y][x] = color;
+    }
+  }
+
+  free(y_offset);
+  free(x_offset);
+}
+
+void default_renderer_multithread(scene_t* scene, camera_t* camera, render_sheet_t* sheet, render_params_t* r_params, int n_threads){
+  int i;
+  pthread_t* threads;
+  threads = malloc(sizeof(pthread_t)*(n_threads-1));
+  struct thread_params* thread_params;
+  thread_params = malloc(sizeof(struct thread_params)*n_threads);
+  double curr, prev;
+
+  prev = 0.;
+  for(i = 0; i < n_threads-1; i++){
+    curr = prev + sheet->height/(double)n_threads;
+    thread_params[i].scene = scene;
+    thread_params[i].camera = camera;
+    thread_params[i].sheet = sheet;
+    thread_params[i].tid = i;
+    thread_params[i].total = n_threads;
+    thread_params[i].params = r_params;
+    pthread_create(threads + i, NULL, default_threadfunc, &thread_params[i]);
+    prev = curr;
+  }
+
+  curr = prev + sheet->height/(double)n_threads;
+  thread_params[n_threads-1].scene = scene;
+  thread_params[n_threads-1].camera = camera;
+  thread_params[n_threads-1].sheet = sheet;
+  thread_params[n_threads-1].tid = n_threads - 1;
+  thread_params[n_threads-1].total = n_threads;
+  thread_params[n_threads-1].params = r_params;
+  default_threadfunc(thread_params + n_threads - 1);
+
+  for(i = 0; i < n_threads-1; i++){
+    pthread_join(threads[i], NULL);
+  }
+
+  free(threads);
+  free(thread_params);
+}
+
+void default_renderer(scene_t* scene, camera_t* camera, render_sheet_t* sheet, render_params_t* r_params){
+  int i, y, x, sample, height, width, bounce;
+  double* y_offset, *x_offset;
+  vec3d_t color, curr_sample, curr_energy, curr_texture;
+  ray_t curr_ray;
+  intersection_t curr_intersection;
+
+  y_offset = malloc(sizeof(double)*r_params->samples_per_pixel);
+  x_offset = malloc(sizeof(double)*r_params->samples_per_pixel);
+
+  for(i = 0; i < r_params->samples_per_pixel; i++){
+    x_offset[i] = 0.5*cos(2.*M_PI*i/r_params->samples_per_pixel);
+    y_offset[i] = 0.5*sin(2.*M_PI*i/r_params->samples_per_pixel);
+  }
+
+  height = sheet->height;
+  width  = sheet->width;
+  
+  for(y = 0; y < height; y++){
+    for(x = 0; x < width; x++){
+      color = (vec3d_t){0., 0., 0.};
+      for(sample = 0; sample < r_params->samples_per_pixel; sample++){
+        curr_sample = (vec3d_t){0., 0., 0.};
+        curr_ray = camera_get_ray(camera, y + y_offset[sample], x + x_offset[sample], height, width);
+
+        for(bounce = 0; bounce < r_params->bounce_limit; bounce++){
+          curr_intersection = closest_intersection(scene, &curr_ray);
+          curr_energy = curr_ray.energy;
+          curr_texture = ray_hit(&curr_ray, &curr_intersection);
+          v3d_hadamard(&curr_energy, &curr_texture, &curr_sample);
+
+          if(!curr_intersection.did_intersect || curr_intersection.sky){
+            break;
+          }
+        }
+        color.x += curr_sample.x/r_params->samples_per_pixel;
+        color.y += curr_sample.y/r_params->samples_per_pixel;
+        color.z += curr_sample.z/r_params->samples_per_pixel;
+      }  
+      sheet->iplane[y][x] = color;
+    }
+  }
+
+  free(y_offset);
+  free(x_offset);
+}
+
+render_sheet_t* render_sheet_new(int width, int height){
+  render_sheet_t* ret = malloc(sizeof(render_sheet_t));
+  ret->iplane = malloc(sizeof(vec3d_t*)*height);
+  ret->iplane[0] = calloc(width*height, sizeof(vec3d_t));
+  for(int i = 1; i < height; ret->iplane[i] = ret->iplane[i-1] + width, i++);
+  ret->width = width, ret->height = height;
+
+  return ret;
+}
+
+void render_sheet_free(render_sheet_t* render_sheet){
+  free(render_sheet->iplane[0]);
+  free(render_sheet->iplane);
+  free(render_sheet);
+}
 
 #define BOUNCE_LIMIT  5
 #define SAMPLES_PER_PIXEL 5
-#define HEIGHT 500
-#define WIDTH  500
+#define HEIGHT 1000
+#define WIDTH  1000
 #define SPHERES 21
 #define SKYHEIGHT 1000
 #define SKYRADIUS 10000
@@ -475,24 +947,14 @@ void dbl2uchar(vec3d_t** dimg, img* uchar, int width, int height){
 int main()
 {
   camera_t camera;
-  vec3d_t tmp, curr_energy, curr_texture;
-  vec3d_t curr_sample, color;
-  ray_t curr_ray;
-  intersection_t curr_intersection;
   scene_object_t scene_objects[SPHERES*SPHERES + 2];
   struct sphere_params sphere_params[SPHERES*SPHERES];
   struct plane_params plane_params;
-  struct sphere_params sky_params;
-  int i, iy, y, x, bounce, sample;
-  double x_offset[SAMPLES_PER_PIXEL], y_offset[SAMPLES_PER_PIXEL], smear;
-  vec3d_t** dimg = alloc_double(WIDTH, HEIGHT);
+  struct sky_params sky_params;
   img_ioerr err;
   img* skybox = img_from_png("skybox.png", &err);
-
-  for(i = 0; i < SAMPLES_PER_PIXEL; i++){
-    x_offset[i] = 0.5*cos(2.*M_PI*i/SAMPLES_PER_PIXEL);
-    y_offset[i] = 0.5*sin(2.*M_PI*i/SAMPLES_PER_PIXEL);
-  }
+  int i, iy, y, x;
+  vec3d_t tmp;
 
   img* image = img_new(WIDTH, HEIGHT);
  
@@ -522,47 +984,29 @@ int main()
   scene_objects[SPHERES*SPHERES+1].sky = true;
   sky_params.origin = (vec3d_t){0., 0., SKYHEIGHT - SKYRADIUS};
   sky_params.radius = SKYRADIUS;
+  sky_params.height = SKYHEIGHT;
+  sky_params.skybox = skybox;
 
   tmp = (vec3d_t){50, 50, 200};
-  camera = camera_with(&tmp, M_PI/4., 5.*M_PI/4., 0., M_PI/1.5, 150, 1, 200);
+  camera = camera_bokeh_with(&tmp, M_PI/4., 5.*M_PI/4., 0., M_PI/1.5, 150, 200, 1);
 
   printf("camera.i = (%lf, %lf, %lf)\n", camera.i.x, camera.i.y, camera.i.z);
   printf("camera.j = (%lf, %lf, %lf)\n", camera.j.x, camera.j.y, camera.j.z);
   printf("camera.k = (%lf, %lf, %lf)\n", camera.k.x, camera.k.y, camera.k.z);
 
-  for(y = 0; y < HEIGHT; y++){
-    for(x = 0; x < WIDTH; x++){
-      color = (vec3d_t){0., 0., 0.};
-      for(sample = 0; sample < SAMPLES_PER_PIXEL; sample++){
-        curr_sample = (vec3d_t){0., 0., 0.};
-        curr_ray = camera_get_ray(&camera, y + y_offset[sample], x + x_offset[sample], HEIGHT, WIDTH);
-        for(bounce = 0; bounce < BOUNCE_LIMIT; bounce++){
-          curr_intersection = closest_intersection(&scene_objects[0], SPHERES*SPHERES+2, &curr_ray);
-          if(bounce == 0){
-            smear = camera_get_smear(&camera, &curr_intersection.point);
-          }
-          curr_energy = curr_ray.energy;
-          curr_texture = ray_hit(&curr_ray, &curr_intersection, skybox, SKYHEIGHT, SKYRADIUS);
-          curr_sample = v3d_hadamard(&curr_energy, &curr_texture);
+  scene_t scene;
+  scene.scene_objects = &scene_objects[0];
+  scene.n_scene_objects = SPHERES*SPHERES + 2;
+  render_sheet_t* sheet = render_sheet_new(WIDTH, HEIGHT);
+  render_params_t r_params;
+  r_params.samples_per_pixel = SAMPLES_PER_PIXEL;
+  r_params.bounce_limit      = BOUNCE_LIMIT;
+  default_renderer_multithread(&scene, &camera, sheet, &r_params, 4);
 
-          if(!curr_intersection.did_intersect || curr_intersection.sky){
-            break;
-          }
-        }
-        color.x += curr_sample.x/SAMPLES_PER_PIXEL;
-        color.y += curr_sample.y/SAMPLES_PER_PIXEL;
-        color.z += curr_sample.z/SAMPLES_PER_PIXEL;
-      }  
-      draw_smeared(dimg, x, y, WIDTH, HEIGHT, smear, &color);
-      //image->pix[y][x] = (pixel){squash(color.x), squash(color.y), squash(color.z), 255};
-    }
-  }
-
-  dbl2uchar(dimg, image, WIDTH, HEIGHT);
-  (void)img_save_to_png(image, "test.png");
+  sheet2uchar(sheet, image, WIDTH, HEIGHT);
+  (void)img_save_to_png(image, "test2.png");
   img_free(image);
   img_free(skybox);
-  free_double(dimg);
 
   return 0;
 }
